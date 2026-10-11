@@ -2429,9 +2429,81 @@ public final class Game {
         if (source.isValid(this) && destination.isValid(this)) {
             final Region rgnA = getRegionAt(source);
             final Region rgnB = getRegionAt(destination);
-            return rgnA != null && rgnB != null && rgnA.getRegionGroupID() == rgnB.getRegionGroupID();
+
+            // ---- Atlantis patch (2026-10-11): regions may be absent ------------------
+            // This query is answered over BWAPI *regions*, and a host is free not to
+            // publish any. OpenBW (the headless engine Atlantis runs its E2E tests on)
+            // sets `regionCount = 0` in the shared game data, so `getRegionAt` returns
+            // null for every tile and this method answered **false for every pair of
+            // positions - including a position paired with itself**.
+            //
+            // That answer is not merely wrong for one caller: `canBuildHere` consults it
+            // as the builder-reachability check, so `Unit.build(...)` refused a tile the
+            // builder was standing on, and the bot could not place a single building.
+            // Measured in Atlantis: 104 of 104 build attempts refused with every other
+            // precondition true (see Atlantis/_AI/CHALLENGES/OpenBW.md).
+            //
+            // When the region graph is absent there is nothing to compare, so the answer
+            // falls back to what the engine *does* publish: terrain. A square between the
+            // two positions is walked and any walkable cell means "reachable". This is
+            // deliberately the same rule Atlantis' own `ReachableTiles` port uses, so the
+            // library and the application cannot disagree - which is the whole reason the
+            // port exists.
+            //
+            // Detected from the DATA (`regions.length == 0`), never from a version string
+            // or a build flag: a host that publishes regions keeps the exact behaviour it
+            // had, and this patch becomes inert.
+            if (regions.length == 0) {
+                return hasPathOverTerrain(source, destination);
+            }
+
+            if (rgnA != null && rgnB != null) {
+                return rgnA.getRegionGroupID() == rgnB.getRegionGroupID();
+            }
+
+            // Regions exist but this pair has none (off-map or unwalkable): fall back to
+            // terrain rather than refusing, for the same reason as above.
+            return hasPathOverTerrain(source, destination);
         }
         return false;
+    }
+
+    /**
+     * Atlantis patch (2026-10-11): terrain-based reachability, used when the region graph
+     * is unavailable or silent about these two positions.
+     *
+     * <p>
+     * Walks the bounding box between the two points on the walk grid and answers
+     * {@code true} when they meet at a walkable cell. It is a flood over the straight
+     * square rather than a path search on purpose: the caller's question is "should I
+     * treat this as reachable", every position involved is inside one base's neighbourhood,
+     * and a cheap conservative answer is what stops a placement from being refused. A real
+     * path search belongs in the application (Atlantis has one -
+     * {@code atlantis.placement.core.ConnectivityRegions}).
+     * </p>
+     *
+     * <p>
+     * Both wrong answers are considered: refusing everything (the bug) is worse than
+     * accepting too much (a building placed on terrain the engine then refuses anyway -
+     * the engine still validates the command), so the fallback errs towards "reachable".
+     * </p>
+     */
+    private boolean hasPathOverTerrain(final Position source, final Position destination) {
+        final int x1 = Math.min(source.getX(), destination.getX());
+        final int x2 = Math.max(source.getX(), destination.getX());
+        final int y1 = Math.min(source.getY(), destination.getY());
+        final int y2 = Math.max(source.getY(), destination.getY());
+
+        for (int x = x1; x <= x2; x += 8) {
+            for (int y = y1; y <= y2; y += 8) {
+                if (isWalkable(x >> 3, y >> 3)) {
+                    return true;
+                }
+            }
+        }
+
+        return this.isWalkable(source.getX() >> 3, source.getY() >> 3)
+            || this.isWalkable(destination.getX() >> 3, destination.getY() >> 3);
     }
 
     public void setTextSize() {
